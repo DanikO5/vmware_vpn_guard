@@ -1,0 +1,150 @@
+"""
+	Name:vmware_vpn_guard.py
+	Copyright:2025
+	Author:Daniel Y.
+	Date: 14/10/25 20:49
+	Description:VPN kill switch for VMware processes. The script continuously monitors for a specific VPN network interface. If the connection drops, it automatically finds and terminates vmware.exe and vmware-vmx.exe to prevent the virtual machine from communicating over an unsecured connection.
+"""
+import psutil
+import time
+import sys
+import threading
+from PIL import Image, ImageDraw
+from pystray import MenuItem as item, Icon
+
+VPN_INTERFACE_KEYWORD = "Bitdefender"
+VM_PROCESS_NAMES = ["vmware.exe", "vmware-vmx.exe"]
+CHECK_INTERVAL = 5
+
+STATE = {
+    "vpn_active": False,
+    "status_message": "Initializing...",
+    "running": True
+}
+STATE_LOCK = threading.Lock()
+
+"""
+	Safely updates the global state.
+	@param vpn_active The current status of the VPN
+	@param message The status message to set
+"""
+def update_status(vpn_active, message):
+	with STATE_LOCK:
+		STATE["vpn_active"] = vpn_active
+		STATE["status_message"] = message
+		if icon.visible:
+			icon.icon = create_icon(vpn_active)
+
+"""
+	Checks if the VPN network interface is active and up.
+	@return True if the VPN is active, False otherwise
+"""
+def is_vpn_active():
+	try:
+		all_interfaces = psutil.net_if_addrs()
+		interface_stats = psutil.net_if_stats()
+
+		for interface_name, addresses in all_interfaces.items():
+			if VPN_INTERFACE_KEYWORD.lower() in interface_name.lower():
+				if interface_name in interface_stats and interface_stats[interface_name].isup:
+					return True
+	except Exception as e:
+		print(f"[ERROR] Could not check network interfaces: {e}")
+	return False
+
+"""
+	Finds and terminates running VMware processes.
+	@return True if processes were killed, False otherwise
+"""
+def find_and_kill_vmware():
+	processes_killed = False
+	for proc in psutil.process_iter(['pid', 'name']):
+		try:
+			if proc.info['name'].lower() in [name.lower() for name in VM_PROCESS_NAMES]:
+				print(f"[WARN] Found running VMware process '{proc.info['name']}'. Forcing shutdown...")
+				proc.kill()
+				processes_killed = True
+				print(f"[SUCCESS] Process {proc.info['pid']} ({proc.info['name']}) was killed.")
+		except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+			print(f"[ERROR] Could not kill process {proc.info.get('name', 'N/A')}: {e}")
+	return processes_killed
+
+"""
+	The main loop that checks VPN status and acts accordingly.
+"""
+def monitor_thread():
+	while True:
+		with STATE_LOCK:
+			if not STATE["running"]:
+				break
+
+		if is_vpn_active():
+			message = f"VPN is ACTIVE. VMware is allowed.\nLast check: {time.strftime('%H:%M:%S')}"
+			update_status(True, message)
+		else:
+			message = f"VPN is INACTIVE. VMware will be terminated.\nLast check: {time.strftime('%H:%M:%S')}"
+			update_status(False, message)
+			if find_and_kill_vmware():
+				icon.notify("VMware processes were terminated because the VPN is inactive.", "VMware VPN Guard")
+
+		time.sleep(CHECK_INTERVAL)
+
+"""
+	Creates a 64x64 pixel icon in memory.
+	@param vpn_active The current status of the VPN
+	@return A PIL Image object for the icon
+"""
+def create_icon(vpn_active):
+	color1 = 'darkgreen' if vpn_active else 'darkred'
+	color2 = 'lime' if vpn_active else 'red'
+	
+	image = Image.new('RGB', (64, 64), color1)
+	dc = ImageDraw.Draw(image)
+	dc.rectangle(
+		(32, 0, 64, 32), fill=color2)
+	dc.rectangle(
+		(0, 32, 32, 64), fill=color2)
+
+	return image
+
+"""
+	Callback function to show the current status in a notification.
+	@param icon The icon object
+	@param item The menu item object
+"""
+def show_status(icon, item):
+	with STATE_LOCK:
+		message = STATE["status_message"]
+	icon.notify(message, "VMware VPN Guard Status")
+
+"""
+	Callback function to stop the monitoring thread and exit.
+	@param icon The icon object
+	@param item The menu item object
+"""
+def quit_program(icon, item):
+	print("[INFO] Quit command received. Shutting down.")
+	with STATE_LOCK:
+		STATE["running"] = False
+	icon.stop()
+
+
+if __name__ == "__main__":
+	if not sys.platform == "win32":
+		print("[ERROR] This script is designed for Windows and requires the system tray.")
+		sys.exit(1)
+
+	print("--- VMware VPN Guard is starting in the background ---")
+	print("--- Right-click the tray icon for options ---")
+
+	menu = (
+		item('Show Status', show_status),
+		item('Quit', quit_program)
+	)
+
+	icon = Icon("VMwareVPNGuard", create_icon(False), "VMware VPN Guard", menu)
+
+	background_thread = threading.Thread(target=monitor_thread, daemon=True)
+	background_thread.start()
+
+	icon.run()
